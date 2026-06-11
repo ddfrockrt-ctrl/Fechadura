@@ -1,0 +1,688 @@
+#include <NimBLEDevice.h>
+#include <Preferences.h>
+
+// =====================================================
+// PINOS
+// =====================================================
+
+#define LOCK_PIN           18
+
+#define LED_PAIRING        2
+#define LED_AUTHORIZED     23
+
+#define BTN_PAIR           13
+#define BTN_INTERNAL_OPEN  19
+#define BTN_BLE_OPEN       21
+
+// =====================================================
+// BLE
+// =====================================================
+
+String BLE_NAME = "RT_LOCK";
+
+#define SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
+#define CHARACTERISTIC_UUID "abcd1234-5678-90ab-cdef-1234567890ab"
+
+// =====================================================
+// VARIAVEIS
+// =====================================================
+
+bool deviceConnected = false;
+bool deviceAuthorized = false;
+bool pairingMode = false;
+
+unsigned long unlockTime = 0;
+unsigned long pairingStart = 0;
+unsigned long blinkTimer = 0;
+unsigned long pairPressStart = 0;
+unsigned long authorizedConnectTime = 0;
+
+bool ledBlinkState = false;
+bool pairWasPressed = false;
+bool pairLongPressHandled = false;
+
+const int unlockDuration = 3000;
+const int pairingTimeout = 30000;
+const uint32_t blePin = 123456;
+
+const unsigned long debounceDelay = 50;
+const unsigned long resetCadastroDelay = 5000;
+const unsigned long bleOpenTimeout = 5000;
+
+const int maxAuthorizedDevices = 3;
+String authorizedDeviceAddresses[maxAuthorizedDevices];
+uint16_t activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
+
+struct ButtonState {
+  bool lastReading = HIGH;
+  bool stableState = HIGH;
+  unsigned long lastChange = 0;
+};
+
+ButtonState pairButton;
+ButtonState internalOpenButton;
+ButtonState bleOpenButton;
+
+// =====================================================
+// OBJETOS BLE
+// =====================================================
+
+NimBLEServer* pServer;
+NimBLECharacteristic* pCharacteristic;
+Preferences preferences;
+
+// =====================================================
+// FUNCOES AUXILIARES
+// =====================================================
+
+void anunciarBLE();
+void desconectarCelularBLE();
+void iniciarModoCadastro();
+
+void atualizarAutorizacao(bool autorizado) {
+
+  deviceAuthorized = autorizado;
+
+  if(deviceAuthorized) {
+    digitalWrite(LED_AUTHORIZED, HIGH);
+  } else {
+    digitalWrite(LED_AUTHORIZED, LOW);
+  }
+}
+
+bool botaoPressionado(uint8_t pin, ButtonState &button) {
+
+  bool reading = digitalRead(pin);
+
+  if(reading != button.lastReading) {
+    button.lastReading = reading;
+    button.lastChange = millis();
+  }
+
+  if((millis() - button.lastChange) > debounceDelay &&
+     reading != button.stableState) {
+
+    button.stableState = reading;
+
+    if(button.stableState == LOW) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+String enderecoConexao(NimBLEConnInfo& connInfo) {
+
+  return String(connInfo.getAddress().toString().c_str());
+}
+
+bool enderecoAutorizado(const String &address) {
+
+  for(int i = 0; i < maxAuthorizedDevices; i++) {
+    if(authorizedDeviceAddresses[i].length() > 0 &&
+       authorizedDeviceAddresses[i] == address) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+int quantidadeDispositivosAutorizados() {
+
+  int total = 0;
+
+  for(int i = 0; i < maxAuthorizedDevices; i++) {
+    if(authorizedDeviceAddresses[i].length() > 0) {
+      total++;
+    }
+  }
+
+  return total;
+}
+
+bool haVagaCadastro() {
+
+  return quantidadeDispositivosAutorizados() < maxAuthorizedDevices;
+}
+
+bool salvarDispositivoAutorizado(const String &address) {
+
+  if(enderecoAutorizado(address)) {
+    return true;
+  }
+
+  for(int i = 0; i < maxAuthorizedDevices; i++) {
+    if(authorizedDeviceAddresses[i].length() == 0) {
+      authorizedDeviceAddresses[i] = address;
+      preferences.putString(("auth_addr_" + String(i)).c_str(), address);
+
+      Serial.println("======================");
+      Serial.println("DISPOSITIVO CADASTRADO");
+      Serial.print("Vaga: ");
+      Serial.println(i + 1);
+      Serial.print("Endereco: ");
+      Serial.println(address);
+      Serial.println("======================");
+
+      return true;
+    }
+  }
+
+  Serial.println("======================");
+  Serial.println("LIMITE DE 3 DISPOSITIVOS ATINGIDO");
+  Serial.println("======================");
+
+  return false;
+}
+
+void apagarCadastroAutorizado() {
+
+  for(int i = 0; i < maxAuthorizedDevices; i++) {
+    authorizedDeviceAddresses[i] = "";
+    preferences.remove(("auth_addr_" + String(i)).c_str());
+  }
+
+  pairingMode = false;
+  atualizarAutorizacao(false);
+
+  Serial.println("======================");
+  Serial.println("CADASTROS APAGADOS");
+  Serial.println("NOVA JANELA DE CADASTRO ABERTA");
+  Serial.println("PIN: 123456");
+  Serial.println("======================");
+
+  if(deviceConnected) {
+    desconectarCelularBLE();
+  }
+
+  iniciarModoCadastro();
+}
+
+void iniciarModoCadastro() {
+
+  if(!haVagaCadastro()) {
+    Serial.println("======================");
+    Serial.println("CADASTRO BLOQUEADO");
+    Serial.println("LIMITE DE 3 DISPOSITIVOS ATINGIDO");
+    Serial.println("SEGURE O BOTAO POR 5 SEGUNDOS PARA APAGAR TODOS");
+    Serial.println("======================");
+    return;
+  }
+
+  pairingMode = true;
+  pairingStart = millis();
+
+  Serial.println("======================");
+  Serial.println("MODO CADASTRO");
+  Serial.println("NOVOS PAREAMENTOS POR 30 SEGUNDOS");
+  Serial.print("Vagas usadas: ");
+  Serial.print(quantidadeDispositivosAutorizados());
+  Serial.println("/3");
+  Serial.println("Nome: RT_LOCK");
+  Serial.println("PIN: 123456");
+  Serial.println("======================");
+
+  anunciarBLE();
+}
+
+void anunciarBLE() {
+
+  NimBLEDevice::startAdvertising();
+
+  Serial.println("======================");
+  Serial.println("BLE ANUNCIANDO");
+  Serial.println("======================");
+}
+
+void desconectarCelularBLE() {
+
+  if(deviceConnected && pServer != nullptr) {
+
+    Serial.println("======================");
+    Serial.println("DESCONECTANDO CELULAR");
+    Serial.println("======================");
+
+    if(activeConnHandle != BLE_HS_CONN_HANDLE_NONE) {
+      pServer->disconnect(activeConnHandle);
+    }
+  }
+}
+
+// =====================================================
+// FUNCAO ABRIR FECHADURA
+// =====================================================
+
+void abrirFechadura() {
+
+  Serial.println("ABRINDO FECHADURA");
+
+  digitalWrite(LOCK_PIN, HIGH);
+
+  unlockTime = millis();
+}
+
+void travarFechadura() {
+
+  digitalWrite(LOCK_PIN, LOW);
+  unlockTime = 0;
+
+  Serial.println("Fechadura desligada");
+}
+
+// =====================================================
+// CALLBACKS SERVIDOR
+// =====================================================
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+
+    deviceConnected = true;
+    activeConnHandle = connInfo.getConnHandle();
+    atualizarAutorizacao(false);
+
+    Serial.println("======================");
+    Serial.println("DISPOSITIVO CONECTADO");
+    Serial.println("AGUARDANDO AUTORIZACAO");
+    Serial.println("======================");
+  }
+
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+
+    deviceConnected = false;
+    activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
+    authorizedConnectTime = 0;
+    atualizarAutorizacao(false);
+
+    Serial.println("======================");
+    Serial.println("DISPOSITIVO DESCONECTADO");
+    Serial.println("======================");
+
+    anunciarBLE();
+  }
+
+  uint32_t onPassKeyDisplay() override {
+
+    if(pairingMode) {
+      Serial.println("PIN solicitado durante cadastro");
+      return blePin;
+    }
+
+    Serial.println("PIN negado: cadastro encerrado");
+    return 999999;
+  }
+
+  void onConfirmPassKey(NimBLEConnInfo& connInfo, uint32_t pin) override {
+
+    bool aceitar = pairingMode && pin == blePin;
+
+    NimBLEDevice::injectConfirmPasskey(connInfo, aceitar);
+
+    if(aceitar) {
+      Serial.println("PIN confirmado");
+    } else {
+      Serial.println("PIN recusado");
+    }
+  }
+
+  void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+
+    String address = enderecoConexao(connInfo);
+
+    bool linkSeguro =
+      connInfo.isEncrypted() &&
+      connInfo.isAuthenticated() &&
+      connInfo.isBonded();
+
+    bool autorizado = false;
+
+    if(linkSeguro && enderecoAutorizado(address)) {
+      autorizado = true;
+    } else if(linkSeguro && pairingMode && haVagaCadastro()) {
+      autorizado = salvarDispositivoAutorizado(address);
+      pairingMode = false;
+      digitalWrite(LED_PAIRING, LOW);
+    }
+
+    atualizarAutorizacao(autorizado);
+
+    Serial.println("======================");
+
+    if(autorizado) {
+      authorizedConnectTime = millis();
+      Serial.println("CELULAR AUTORIZADO");
+      Serial.println("VINCULO BLE CONFIRMADO");
+      Serial.println("APERTE O BOTAO GPIO 21 EM ATE 5 SEGUNDOS");
+    } else {
+      authorizedConnectTime = 0;
+      Serial.println("CELULAR NAO AUTORIZADO");
+      Serial.println("FECHADURA BLOQUEADA");
+      desconectarCelularBLE();
+    }
+
+    Serial.println("======================");
+  }
+};
+
+// =====================================================
+// CALLBACKS CHARACTERISTIC
+// =====================================================
+
+class CharacteristicCallbacks : public NimBLECharacteristicCallbacks {
+
+  void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
+
+    if(!deviceAuthorized) {
+
+      Serial.println("======================");
+      Serial.println("COMANDO BLE IGNORADO");
+      Serial.println("CELULAR NAO AUTORIZADO");
+      Serial.println("======================");
+
+      return;
+    }
+
+    std::string value = pCharacteristic->getValue();
+
+    if(value.length() > 0) {
+
+      String command = String(value.c_str());
+
+      command.trim();
+      command.toUpperCase();
+
+      Serial.print("Comando recebido: ");
+      Serial.println(command);
+
+      if(command == "OPEN" || command == "UNLOCK" || command == "ABRIR" || command == "1") {
+
+        Serial.println("======================");
+        Serial.println("COMANDO BLE: ABRIR");
+        Serial.println("======================");
+
+        abrirFechadura();
+        desconectarCelularBLE();
+
+      } else if(command == "LOCK" || command == "TRAVAR" || command == "0") {
+
+        Serial.println("======================");
+        Serial.println("COMANDO BLE: TRAVAR");
+        Serial.println("======================");
+
+        travarFechadura();
+
+      } else {
+
+        Serial.println("======================");
+        Serial.println("COMANDO BLE DESCONHECIDO");
+        Serial.println("======================");
+      }
+    }
+  }
+};
+
+// =====================================================
+// INICIAR BLE
+// =====================================================
+
+void iniciarBLE() {
+
+  preferences.begin("rt_lock", false);
+
+  for(int i = 0; i < maxAuthorizedDevices; i++) {
+    authorizedDeviceAddresses[i] =
+      preferences.getString(("auth_addr_" + String(i)).c_str(), "");
+  }
+
+  String oldSingleAddress = preferences.getString("auth_addr", "");
+  if(oldSingleAddress.length() > 0 && quantidadeDispositivosAutorizados() == 0) {
+    authorizedDeviceAddresses[0] = oldSingleAddress;
+    preferences.putString("auth_addr_0", oldSingleAddress);
+    preferences.remove("auth_addr");
+  }
+
+  if(quantidadeDispositivosAutorizados() > 0) {
+    Serial.println("======================");
+    Serial.println("DISPOSITIVOS AUTORIZADOS CARREGADOS");
+    for(int i = 0; i < maxAuthorizedDevices; i++) {
+      if(authorizedDeviceAddresses[i].length() > 0) {
+        Serial.print("Vaga ");
+        Serial.print(i + 1);
+        Serial.print(": ");
+        Serial.println(authorizedDeviceAddresses[i]);
+      }
+    }
+    Serial.println("======================");
+  }
+
+  NimBLEDevice::init(BLE_NAME.c_str());
+
+  NimBLEDevice::setSecurityAuth(true, true, true);
+  NimBLEDevice::setSecurityPasskey(blePin);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+
+  pServer = NimBLEDevice::createServer();
+
+  pServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService* pService =
+    pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      NIMBLE_PROPERTY::WRITE |
+                      NIMBLE_PROPERTY::WRITE_NR |
+                      NIMBLE_PROPERTY::WRITE_ENC |
+                      NIMBLE_PROPERTY::WRITE_AUTHEN
+                    );
+
+  pCharacteristic->setCallbacks(
+    new CharacteristicCallbacks()
+  );
+
+  pService->start();
+
+  NimBLEAdvertising* pAdvertising =
+    NimBLEDevice::getAdvertising();
+
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setName(BLE_NAME.c_str());
+  pAdvertising->enableScanResponse(true);
+
+  Serial.println("BLE CONFIGURADO");
+
+  anunciarBLE();
+}
+
+// =====================================================
+// VERIFICAR BOTAO PAREAMENTO
+// =====================================================
+
+void verificarPareamento() {
+
+  bool pairPressedNow = digitalRead(BTN_PAIR) == LOW;
+
+  if(pairPressedNow && !pairWasPressed) {
+    pairWasPressed = true;
+    pairPressStart = millis();
+    pairLongPressHandled = false;
+  }
+
+  if(pairPressedNow && !pairLongPressHandled &&
+     millis() - pairPressStart >= resetCadastroDelay) {
+
+    pairLongPressHandled = true;
+    apagarCadastroAutorizado();
+  }
+
+  if(!pairPressedNow && pairWasPressed) {
+
+    pairWasPressed = false;
+
+    if(!pairLongPressHandled && !pairingMode) {
+      iniciarModoCadastro();
+    }
+  }
+
+  if(pairingMode &&
+     millis() - pairingStart > pairingTimeout) {
+
+    pairingMode = false;
+    digitalWrite(LED_PAIRING, LOW);
+
+    Serial.println("======================");
+    Serial.println("CADASTRO ENCERRADO");
+    Serial.println("NOVOS PAREAMENTOS BLOQUEADOS");
+    Serial.println("DISPOSITIVOS VINCULADOS CONTINUAM CONECTANDO");
+    Serial.println("======================");
+
+    anunciarBLE();
+  }
+}
+
+// =====================================================
+// LED PISCANDO
+// =====================================================
+
+void controlarLEDPareamento() {
+
+  if(pairingMode) {
+
+    if(millis() - blinkTimer > 300) {
+
+      blinkTimer = millis();
+      ledBlinkState = !ledBlinkState;
+
+      digitalWrite(LED_PAIRING, ledBlinkState);
+    }
+  } else {
+
+    digitalWrite(LED_PAIRING, LOW);
+  }
+}
+
+// =====================================================
+// BOTAO INTERNO
+// =====================================================
+
+void verificarBotaoInterno() {
+
+  if(botaoPressionado(BTN_INTERNAL_OPEN, internalOpenButton)) {
+
+    Serial.println("======================");
+    Serial.println("ABERTURA INTERNA");
+    Serial.println("======================");
+
+    abrirFechadura();
+  }
+}
+
+// =====================================================
+// BOTAO LIBERAR BLE
+// =====================================================
+
+void verificarBotaoBLE() {
+
+  if(botaoPressionado(BTN_BLE_OPEN, bleOpenButton)) {
+
+    if(deviceConnected && deviceAuthorized) {
+
+      Serial.println("======================");
+      Serial.println("ABERTURA VIA BLE");
+      Serial.println("======================");
+
+      abrirFechadura();
+
+      desconectarCelularBLE();
+    } else {
+
+      Serial.println("======================");
+      Serial.println("BOTAO BLE BLOQUEADO");
+      Serial.println("CELULAR AUSENTE OU NAO AUTORIZADO");
+      Serial.println("======================");
+    }
+  }
+}
+
+void verificarTimeoutBotaoBLE() {
+
+  if(deviceConnected &&
+     deviceAuthorized &&
+     authorizedConnectTime > 0 &&
+     millis() - authorizedConnectTime > bleOpenTimeout) {
+
+    Serial.println("======================");
+    Serial.println("TEMPO ESGOTADO");
+    Serial.println("BOTAO GPIO 21 NAO FOI PRESSIONADO");
+    Serial.println("DESCONECTANDO CELULAR");
+    Serial.println("======================");
+
+    authorizedConnectTime = 0;
+    desconectarCelularBLE();
+  }
+}
+
+// =====================================================
+// DESLIGA FECHADURA
+// =====================================================
+
+void controlarFechadura() {
+
+  if(unlockTime > 0 &&
+     millis() - unlockTime > unlockDuration) {
+
+    travarFechadura();
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(LOCK_PIN, OUTPUT);
+
+  pinMode(LED_PAIRING, OUTPUT);
+  pinMode(LED_AUTHORIZED, OUTPUT);
+
+  pinMode(BTN_PAIR, INPUT_PULLUP);
+  pinMode(BTN_INTERNAL_OPEN, INPUT_PULLUP);
+  pinMode(BTN_BLE_OPEN, INPUT_PULLUP);
+
+  digitalWrite(LOCK_PIN, LOW);
+
+  digitalWrite(LED_PAIRING, LOW);
+  digitalWrite(LED_AUTHORIZED, LOW);
+
+  iniciarBLE();
+
+  Serial.println("======================");
+  Serial.println("SISTEMA INICIADO");
+  Serial.println("TOQUE NO BOTAO DE CADASTRO PARA PAREAR");
+  Serial.println("SEGURE 5 SEGUNDOS PARA APAGAR O CADASTRO");
+  Serial.println("======================");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+
+  verificarPareamento();
+
+  controlarLEDPareamento();
+
+  verificarBotaoInterno();
+
+  verificarBotaoBLE();
+
+  verificarTimeoutBotaoBLE();
+
+  controlarFechadura();
+}
